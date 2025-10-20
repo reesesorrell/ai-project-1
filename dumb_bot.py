@@ -59,7 +59,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true", help="Suppress per-move prints.")
     args = parser.parse_args()
 
-    game_num = 100000
+    game_num = 10000
     max_tile_list = []
     high_score_list = []
     for i in range(game_num):

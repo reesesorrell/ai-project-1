@@ -218,9 +218,9 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=10_000, help="Max steps per game")
     parser.add_argument("--sleep", type=float, default=0.0, help="Pause between moves (seconds)")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-move prints")
-    parser.add_argument("--depth", type=int, default=4, help="Search depth (plies)")
+    parser.add_argument("--depth", type=int, default=3, help="Search depth (plies)")
     parser.add_argument("--chance-samples", type=int, default=1, help="Samples per chance node for preview randomness")
-    parser.add_argument("--games", type=int, default=5, help="Number of games to run")
+    parser.add_argument("--games", type=int, default=10, help="Number of games to run")
     args = parser.parse_args()
 
     max_tile_list = []
@@ -230,7 +230,7 @@ if __name__ == "__main__":
     for i in range(args.games):
         # To vary seeds if not provided, offset by i
         seed = args.seed if args.seed is not None else None
-        result = play(seed=seed, max_steps=args.steps, sleep=args.sleep, verbose=not args.quiet,
+        result = play(seed=seed, max_steps=args.steps, sleep=args.sleep, verbose=args.quiet,
                       depth=args.depth, chance_samples=args.chance_samples)
         max_tile_list.append(result[0])
         high_score_list.append(result[1])
