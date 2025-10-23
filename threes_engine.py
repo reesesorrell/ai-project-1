@@ -1,11 +1,21 @@
-# threes_engine.py
-# Compact Threes engine with 64-bit board, one-step slide, deck + bonus pool.
+# threes_engine_numba.py
+# Threes engine optimized for optimax: precomputed LUTs + Numba-compiled hot paths.
 # Python 3.10+
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Iterable
+from typing import List, Tuple, Optional
 import random
+
+# Optional JIT (fallback to pure Python automatically)
+try:
+    import numpy as _np  # type: ignore
+    from numba import njit  # type: ignore
+    import numpy as _np
+    U64_MASK = (1 << 64) - 1
+    _NUMBA_OK = True
+except Exception:  # numpy/numba not available
+    _NUMBA_OK = False
 
 # ---------------------------
 # Encoding helpers (nibbles)
@@ -29,21 +39,34 @@ def set_row16(board: int, r: int, row16: int) -> int:
     return (board & ~m) | ((row16 & 0xFFFF) << (r * 16))
 
 def reverse_row16(row16: int) -> int:
-    # Swap nibbles: [a b c d] -> [d c b a]
-    a = (row16 >> 0) & 0xF
-    b = (row16 >> 4) & 0xF
-    c = (row16 >> 8) & 0xF
-    d = (row16 >> 12) & 0xF
-    return (a << 12) | (b << 8) | (c << 4) | (d << 0)
+    # Fast nibble-swap: [a b c d] -> [d c b a]
+    return ((row16 & 0x000F) << 12) | ((row16 & 0x00F0) << 4) | \
+           ((row16 & 0x0F00) >> 4)  | ((row16 & 0xF000) >> 12)
 
 def transpose_4x4(board: int) -> int:
-    # Generic (tiny) transpose; simple loops are plenty fast for Python here.
-    out = 0
-    for r in range(4):
-        for c in range(4):
-            v = (board >> pos_shift(r, c)) & 0xF
-            out |= (v << pos_shift(c, r))
-    return out
+    """Unrolled transpose of 4x4 nibbles packed into 64-bit int."""
+    result = 0
+    # Row 0 -> Column 0
+    result |= ((board >>  0) & 0xF) <<  0
+    result |= ((board >>  4) & 0xF) << 16
+    result |= ((board >>  8) & 0xF) << 32
+    result |= ((board >> 12) & 0xF) << 48
+    # Row 1 -> Column 1
+    result |= ((board >> 16) & 0xF) <<  4
+    result |= ((board >> 20) & 0xF) << 20
+    result |= ((board >> 24) & 0xF) << 36
+    result |= ((board >> 28) & 0xF) << 52
+    # Row 2 -> Column 2
+    result |= ((board >> 32) & 0xF) <<  8
+    result |= ((board >> 36) & 0xF) << 24
+    result |= ((board >> 40) & 0xF) << 40
+    result |= ((board >> 44) & 0xF) << 56
+    # Row 3 -> Column 3
+    result |= ((board >> 48) & 0xF) << 12
+    result |= ((board >> 52) & 0xF) << 28
+    result |= ((board >> 56) & 0xF) << 44
+    result |= ((board >> 60) & 0xF) << 60
+    return result
 
 # ---------------------------
 # Value/code conversions
@@ -53,15 +76,13 @@ def code_to_value(code: int) -> int:
     if code == 0: return 0
     if code == 1: return 1
     if code == 2: return 2
-    # 3,6,12,... doubling sequence
     return 3 << (code - 3)
 
 def value_to_code(value: int) -> int:
     if value == 0: return 0
     if value == 1: return 1
     if value == 2: return 2
-    # value must be 3 * 2^k
-    k = (value // 3).bit_length() - 1  # since value is a power of two times 3
+    k = (value // 3).bit_length() - 1
     return 3 + k
 
 def can_merge(left_code: int, right_code: int) -> bool:
@@ -71,19 +92,14 @@ def can_merge(left_code: int, right_code: int) -> bool:
     return False
 
 def merge_code(left_code: int, right_code: int) -> int:
-    # Precondition: can_merge(left_code, right_code) is True
     if (left_code, right_code) in ((1,2),(2,1)): return 3
-    return left_code + 1  # equal >=3 -> next code (double value)
+    return left_code + 1
 
 # ---------------------------
-# Precompute row-left transitions (one-step slide)
-# Table entry: 0..65535 -> (new_row16 | (changed<<16))
+# Row transition tables (Python build)
 # ---------------------------
 
-ROW_LEFT_TABLE: List[int] = [0] * 65536
-
-def _simulate_row_left(row16: int) -> Tuple[int, bool]:
-    # Extract 4 nibbles into a mutable list
+def _simulate_row_left_py(row16: int) -> Tuple[int, bool]:
     cells = [
         (row16 >> 0) & 0xF,
         (row16 >> 4) & 0xF,
@@ -91,9 +107,7 @@ def _simulate_row_left(row16: int) -> Tuple[int, bool]:
         (row16 >> 12) & 0xF,
     ]
     changed = False
-    merged = [False, False, False, False]  # track merges at target slots
-
-    # Process leftward one step, left-to-right
+    merged = [False, False, False, False]
     for i in range(1, 4):
         v = cells[i]
         if v == 0:
@@ -103,24 +117,123 @@ def _simulate_row_left(row16: int) -> Tuple[int, bool]:
             cells[i-1] = v
             cells[i] = 0
             changed = True
-        elif can_merge(left, v) and not merged[i-1]:
-            cells[i-1] = merge_code(left, v)
+        elif ((left, v) in ((1,2),(2,1)) or (left >= 3 and left == v)) and not merged[i-1]:
+            cells[i-1] = 3 if (left, v) in ((1,2),(2,1)) else left + 1
             cells[i] = 0
             merged[i-1] = True
             changed = True
-        else:
-            # stays
-            pass
-
     new_row16 = (cells[0] << 0) | (cells[1] << 4) | (cells[2] << 8) | (cells[3] << 12)
     return new_row16, changed
 
-def _build_row_table() -> None:
-    for row16 in range(65536):
-        new_row, ch = _simulate_row_left(row16)
-        ROW_LEFT_TABLE[row16] = new_row | (int(ch) << 16)
+# Build tables (Python, once)
+ROW_LEFT_TABLE_PY: List[int] = [0] * 65536
+REVERSE_ROW16_PY:  List[int] = [0] * 65536
+ROW_RIGHT_TABLE_PY: List[int] = [0] * 65536
 
-_build_row_table()
+for row16 in range(65536):
+    new_row, ch = _simulate_row_left_py(row16)
+    ROW_LEFT_TABLE_PY[row16] = new_row | (int(ch) << 16)
+
+for r in range(65536):
+    REVERSE_ROW16_PY[r] = reverse_row16(r)
+
+for r in range(65536):
+    entry = ROW_LEFT_TABLE_PY[REVERSE_ROW16_PY[r]]
+    new_rev = entry & 0xFFFF
+    changed = (entry >> 16) & 1
+    new_row = REVERSE_ROW16_PY[new_rev]
+    ROW_RIGHT_TABLE_PY[r] = new_row | (changed << 16)
+
+# Numba-friendly versions of the tables
+if _NUMBA_OK:
+    ROW_LEFT_TABLE = _np.asarray(ROW_LEFT_TABLE_PY, dtype=_np.uint32)
+    ROW_RIGHT_TABLE = _np.asarray(ROW_RIGHT_TABLE_PY, dtype=_np.uint32)
+else:
+    ROW_LEFT_TABLE = ROW_LEFT_TABLE_PY
+    ROW_RIGHT_TABLE = ROW_RIGHT_TABLE_PY
+
+# Score table
+SCORE_LUT: Tuple[int, ...] = tuple(0 if c < 3 else 3 ** (c - 2) for c in range(16))
+
+# ---------------------------
+# Numba hot functions
+# ---------------------------
+
+if _NUMBA_OK:
+
+    @njit(cache=True, fastmath=True)
+    def _transpose_4x4_nb(board: _np.uint64) -> _np.uint64:
+        b = board
+        result = _np.uint64(0)
+        result |= ((b >>  0) & 0xF) <<  0
+        result |= ((b >>  4) & 0xF) << 16
+        result |= ((b >>  8) & 0xF) << 32
+        result |= ((b >> 12) & 0xF) << 48
+        result |= ((b >> 16) & 0xF) <<  4
+        result |= ((b >> 20) & 0xF) << 20
+        result |= ((b >> 24) & 0xF) << 36
+        result |= ((b >> 28) & 0xF) << 52
+        result |= ((b >> 32) & 0xF) <<  8
+        result |= ((b >> 36) & 0xF) << 24
+        result |= ((b >> 40) & 0xF) << 40
+        result |= ((b >> 44) & 0xF) << 56
+        result |= ((b >> 48) & 0xF) << 12
+        result |= ((b >> 52) & 0xF) << 28
+        result |= ((b >> 56) & 0xF) << 44
+        result |= ((b >> 60) & 0xF) << 60
+        return result
+
+    @njit(cache=True, fastmath=True)
+    def _get_row16_nb(board: _np.uint64, r: _np.uint8) -> _np.uint16:
+        return _np.uint16((board >> (r * 16)) & _np.uint64(0xFFFF))
+
+    @njit(cache=True, fastmath=True)
+    def _set_row16_nb(board: _np.uint64, r: _np.uint8, row16: _np.uint16) -> _np.uint64:
+        m = _np.uint64(0xFFFF) << (r * 16)
+        return (board & ~m) | (_np.uint64(row16) << (r * 16))
+
+    @njit(cache=True, fastmath=True)
+    def _move_rows_nb(board: _np.uint64, table: _np.ndarray) -> Tuple[_np.uint64, _np.uint8, _np.uint8]:
+        """
+        Apply row-wise move using a precomputed table.
+        Returns (new_board, candidates_mask, moved_flag)
+        - candidates_mask: 4-bit mask, bit r=1 if row r changed (spawn at edge determined by caller)
+        - moved_flag: 1 if any row changed
+        """
+        out = board
+        candidates_mask = _np.uint8(0)
+        moved_any = _np.uint8(0)
+        for r in range(4):
+            row = _get_row16_nb(out, r)
+            entry = _np.uint32(table[row])
+            new_row = _np.uint16(entry & 0xFFFF)
+            changed = _np.uint8((entry >> 16) & 1)
+            if changed:
+                moved_any = _np.uint8(1)
+                candidates_mask |= _np.uint8(1 << r)
+            if new_row != row:
+                out = _set_row16_nb(out, r, new_row)
+        return out, candidates_mask, moved_any
+
+    @njit(cache=True, fastmath=True)
+    def move_left_nb(board: _np.uint64) -> Tuple[_np.uint64, _np.uint8, _np.uint8]:
+        return _move_rows_nb(board, ROW_LEFT_TABLE)
+
+    @njit(cache=True, fastmath=True)
+    def move_right_nb(board: _np.uint64) -> Tuple[_np.uint64, _np.uint8, _np.uint8]:
+        return _move_rows_nb(board, ROW_RIGHT_TABLE)
+
+    @njit(cache=True, fastmath=True)
+    def move_up_nb(board: _np.uint64) -> Tuple[_np.uint64, _np.uint8, _np.uint8]:
+        tb = _transpose_4x4_nb(board)
+        nb, mask, moved = _move_rows_nb(tb, ROW_LEFT_TABLE)
+        return _transpose_4x4_nb(nb), mask, moved  # mask bits correspond to columns
+
+    @njit(cache=True, fastmath=True)
+    def move_down_nb(board: _np.uint64) -> Tuple[_np.uint64, _np.uint8, _np.uint8]:
+        tb = _transpose_4x4_nb(board)
+        nb, mask, moved = _move_rows_nb(tb, ROW_RIGHT_TABLE)
+        return _transpose_4x4_nb(nb), mask, moved
 
 # ---------------------------
 # Deck + bonus pool
@@ -129,7 +242,7 @@ _build_row_table()
 @dataclass
 class BasicDeck:
     rng: random.Random
-    cards: List[int] = None
+    cards: Optional[List[int]] = None
     idx: int = 0
 
     def __post_init__(self):
@@ -141,22 +254,21 @@ class BasicDeck:
         self.idx = 0
 
     def peek(self) -> int:
+        if self.idx >= len(self.cards):
+            self._fresh()
         return self.cards[self.idx]
 
     def draw(self) -> int:
         v = self.cards[self.idx]
         self.idx += 1
         if self.idx >= len(self.cards):
-            # Immediately create a fresh shuffled deck for future peeks/draws.
             self._fresh()
         return v
 
 def bonus_pool_codes(max_board_value: int) -> List[int]:
-    # Pool: {6,12,24,...} up to floor(high/8)
     cap = max_board_value // 8
     if cap < 6:
         return []
-    # Find highest 6*2^k <= cap
     out = []
     v = 6
     while v <= cap:
@@ -181,37 +293,35 @@ class Threes:
     @staticmethod
     def new(seed: Optional[int] = None) -> "Threes":
         rng = random.Random(seed)
-        g = Threes(rng=rng, board=0, deck=BasicDeck(rng))
+        g = Threes(rng=rng, deck=BasicDeck(rng))
         g._init_board()
-        g._draw_next_card()  # initial preview
+        g._draw_next_card()
         return g
 
     # ---------- Board init ----------
 
     def _init_board(self):
-        # Fresh deck already created in __post_init__
-        # Draw 9 basic cards and place randomly
+        # Draw 8 basic cards and place randomly
         cells = [(r, c) for r in range(4) for c in range(4)]
         self.rng.shuffle(cells)
         for (r, c) in cells[:8]:
-            code = self.deck.draw()  # at start: always from deck (no bonus yet)
+            code = self.deck.draw()
             self.board = set_cell(self.board, r, c, code)
 
     # ---------- Utilities ----------
 
     def max_value(self) -> int:
-        m = 0
         b = self.board
+        max_code = 0
         for i in range(16):
-            code = (b >> (i*4)) & 0xF
-            if code:
-                v = code_to_value(code)
-                if v > m:
-                    m = v
-        return m
+            c = (b >> (i * 4)) & 0xF
+            if c > max_code:
+                max_code = c
+        if max_code <= 2:
+            return max_code
+        return 3 << (max_code - 3)
 
     def _draw_next_card(self):
-        # Choose next card based on current board (after last placement)
         pool = bonus_pool_codes(self.max_value())
         use_bonus = bool(pool) and (self.rng.randrange(21) == 0)
         if use_bonus:
@@ -222,82 +332,94 @@ class Threes:
             self.next_is_bonus = False
 
     def next_preview(self) -> str:
-        """
-        Returns (kind, display):
-          kind in {"exact","ambiguous"}
-          display: "1", "2", or "3+"
-        """
-        if self.next_card in (1, 2):
-            return ("1" if self.next_card == 1 else "2")
-        return ("3+")
+        return "1" if self.next_card == 1 else ("2" if self.next_card == 2 else "3+")
+
+    # ---------- Candidates helpers ----------
+
+    @staticmethod
+    def _mask_to_indices(mask: int) -> List[int]:
+        # Convert 4-bit mask to indices [0..3]
+        out = []
+        if mask & 1: out.append(0)
+        if mask & 2: out.append(1)
+        if mask & 4: out.append(2)
+        if mask & 8: out.append(3)
+        return out
 
     # ---------- Moves ----------
 
     def _move_left_rows(self, board: int) -> Tuple[int, List[int], bool]:
-        """
-        Returns (new_board, spawn_candidates, moved)
-        spawn_candidates are absolute cell indices (0..15) at the right edge for rows that changed.
-        """
+        if _NUMBA_OK:
+            nb, mask, moved = move_left_nb(_np.uint64(board & U64_MASK))
+            # mask bits denote rows that changed; spawn at right edge col=3
+            candidates = [r*4 + 3 for r in self._mask_to_indices(int(mask))]
+            return int(nb), candidates, bool(moved)
+        # Fallback Python path
         moved_any = False
         out = board
         candidates = []
+        table = ROW_LEFT_TABLE_PY
         for r in range(4):
             row = get_row16(out, r)
-            entry = ROW_LEFT_TABLE[row]
+            entry = table[row]
             new_row = entry & 0xFFFF
             changed = (entry >> 16) & 1
             if changed:
                 moved_any = True
-                candidates.append(r*4 + 3)  # right-edge cell of this row
+                candidates.append(r*4 + 3)
             if new_row != row:
                 out = set_row16(out, r, new_row)
         return out, candidates, moved_any
 
     def _move_right_rows(self, board: int) -> Tuple[int, List[int], bool]:
+        if _NUMBA_OK:
+            nb, mask, moved = move_right_nb(_np.uint64(board & U64_MASK))
+            candidates = [r*4 + 0 for r in self._mask_to_indices(int(mask))]
+            return int(nb), candidates, bool(moved)
         moved_any = False
         out = board
         candidates = []
+        table = ROW_RIGHT_TABLE_PY
         for r in range(4):
             row = get_row16(out, r)
-            rev_row = reverse_row16(row)
-            entry = ROW_LEFT_TABLE[rev_row]
-            new_rev = entry & 0xFFFF
+            entry = table[row]
+            new_row = entry & 0xFFFF
             changed = (entry >> 16) & 1
-            new_row = reverse_row16(new_rev)
             if changed:
                 moved_any = True
-                candidates.append(r*4 + 0)  # left-edge cell of this row
+                candidates.append(r*4 + 0)
             if new_row != row:
                 out = set_row16(out, r, new_row)
         return out, candidates, moved_any
 
     def _move_up_cols(self, board: int) -> Tuple[int, List[int], bool]:
-        # Transpose, do left, transpose back.
+        if _NUMBA_OK:
+            nb, mask, moved = move_up_nb(_np.uint64(board & U64_MASK))
+            # mask bits denote columns (because we operated in transposed space)
+            candidates = [3*4 + c for c in self._mask_to_indices(int(mask))]  # bottom row
+            return int(nb), candidates, bool(moved)
         tb = transpose_4x4(board)
         tb2, row_candidates, moved = self._move_left_rows(tb)
-        # Map candidates (in transposed space) back to absolute positions: right-edge in transposed -> bottom row in original.
         candidates = []
         for idx in row_candidates:
             tr = idx // 4
-            # right-edge col=3 in transposed -> row=3 in original
-            candidates.append(3*4 + tr)  # (row=3, col=tr)
+            candidates.append(3*4 + tr)
         return transpose_4x4(tb2), candidates, moved
 
     def _move_down_cols(self, board: int) -> Tuple[int, List[int], bool]:
+        if _NUMBA_OK:
+            nb, mask, moved = move_down_nb(_np.uint64(board & U64_MASK))
+            candidates = [0*4 + c for c in self._mask_to_indices(int(mask))]  # top row
+            return int(nb), candidates, bool(moved)
         tb = transpose_4x4(board)
         tb2, row_candidates, moved = self._move_right_rows(tb)
-        # Left-edge in transposed -> top row in original.
         candidates = []
         for idx in row_candidates:
             tr = idx // 4
-            candidates.append(0*4 + tr)  # (row=0, col=tr)
+            candidates.append(0*4 + tr)
         return transpose_4x4(tb2), candidates, moved
 
     def try_move(self, direction: MoveDir) -> bool:
-        """
-        Apply one move if valid; return True if anything changed (and a card was spawned).
-        Direction: 0=L,1=R,2=U,3=D
-        """
         if direction == 0:
             nb, candidates, moved = self._move_left_rows(self.board)
         elif direction == 1:
@@ -310,26 +432,20 @@ class Threes:
             raise ValueError("direction must be 0..3")
 
         if not moved or not candidates:
-            return False  # invalid/no-op
+            return False
 
-        # Place the already-previewed next_card onto a random candidate edge slot
+        # Place next_card on a random candidate edge slot
         spawn_pos = self.rng.choice(candidates)
         sr, sc = divmod(spawn_pos, 4)
-        # Should be empty; assert in debug
-        # assert get_cell(nb, sr, sc) == 0
-        nb = set_cell(nb, sr, sc, self.next_card)
+        self.board = set_cell(nb, sr, sc, self.next_card)
 
-        self.board = nb
-
-        # Draw new preview for next turn (uses UPDATED board for bonus pool limits)
         self._draw_next_card()
         return True
 
     # ---------- Convenience ----------
 
     def has_moves(self) -> bool:
-        # If any direction yields a change, we have moves.
-        for d in range(4):
+        for d in (0, 1, 2, 3):
             if self._peek_move(d):
                 return True
         return False
@@ -345,30 +461,14 @@ class Threes:
             _, _, moved = self._move_down_cols(self.board)
         return moved
 
-    # Classic Threes! score for a 64-bit nibble-encoded board.
-    # Each tile is stored as a 4-bit *code*:
-    #   0 -> empty, 1 -> tile '1', 2 -> tile '2', 3 -> '3', 4 -> '6', 5 -> '12', ...
-    # Score rule: only codes >=3 contribute; code c contributes 3^(c-2).
-
     def score_board(self) -> int:
-        """
-        Compute the classic Threes! score from a 64-bit nibble board.
-        Args:
-            board: int, 16 tiles packed as 4-bit codes (row-major), i*4 shift per tile.
-        Returns:
-            int: total score.
-        """
-        SCORE_LUT = tuple(0 if c < 3 else 3 ** (c - 2) for c in range(16))
         total = 0
-        # 16 tiles, each 4 bits
+        b = self.board
         for i in range(16):
-            code = (self.board >> (i * 4)) & 0xF
-            total += SCORE_LUT[code]
+            total += SCORE_LUT[(b >> (i * 4)) & 0xF]
         return total
 
-
     def print_board(self):
-        # For debugging: print raw values (not codes)
         rows = []
         for r in range(4):
             row = []
@@ -379,20 +479,19 @@ class Threes:
         print("\n".join(rows))
 
 # ---------------------------
-# Quick demo
+# Quick demo (interactive)
 # ---------------------------
 
 if __name__ == "__main__":
-
-    rng = random.Random(1337)  # set a seed for reproducibility in this demo
-    game = Threes.new(seed=rng)
+    rng = random.Random(1337)
+    game = Threes.new(seed=1337)
 
     print("Threes! – demo")
     print("Controls: w/a/s/d for up/left/down/right; q to quit\n")
 
     while True:
         disp = game.next_preview()
-        print("Initial board:")
+        print("Current board:")
         game.print_board()
         print("Next preview:", disp)
 
