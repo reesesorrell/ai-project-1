@@ -1,17 +1,18 @@
 # threes_expectimax_board.py
 """
-Board-centric, deck-aware Expectimax for Threes! (uses threes_engine_numba.py)
+Board-centric, deck-aware Monte Carlo for Threes! (uses threes_engine_numba.py)
 
 - Immediate spawn: uses the CURRENT preview deterministically (no branching).
-- Deeper plies: average the NEXT preview over {1,2,3} using remaining shoe counts.
+- Deeper plies: simulate the NEXT preview over {1,2,3} using remaining shoe counts.
   * If counts are (n1, n2, n3), use probabilities n1/T, n2/T, n3/T (T=n1+n2+n3).
   * If T == 0 (shoe exhausted), reshuffle to (4,4,4) and use uniform 1/3 each.
 - Ignores bonus (big) cards for preview probabilities (per request). If the current
   preview is a bonus (>=4), we still place it deterministically; shoe counts unchanged.
 
 - Search state is (board:int, next_card:int, n1:int, n2:int, n3:int).
-- Uses Numba move kernels from threes_engine_numba, transposition table, FIXED DEPTH.
-- Supports multi-game runs (serial) and prints a summary (low/median/high + tile thresholds).
+- Provides Monte Carlo playout policy (fixed depth), serial-only.
+- Supports multi-game runs and prints a summary (low/median/high + tile thresholds).
+- Plots: histogram, box/whisker, ECDF, and threshold hit-rates (optional).
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 import statistics
 import numpy as np
+import os
+import matplotlib.pyplot as plt
 
 # CHANGE WHICH IMPORT IS ACTIVE TO TEST YOUR HEURISTIC
 from heuristic_reese import evaluate_board
@@ -138,112 +141,96 @@ def next_preview_outcomes(n1: int, n2: int, n3: int) -> List[Tuple[int, float, T
         outcomes.append((3, n3 / T, (n1, n2, n3 - 1)))
     return outcomes
 
-# ---- Expectimax core (deck-aware) ----
+# ---- Monte Carlo (deck-aware) ----
 
 @dataclass
-class EMParams:
-    depth: int = 8
-    move_order: Tuple[int, int, int, int] = (1, 3, 0, 2)  # R, D, L, U
+class MCParams:
+    depth: int = 8           # playout agent-move depth
+    rollouts: int = 512      # rollouts per root move
+    move_order: Tuple[int, int, int, int] = (1, 3, 0, 2)  # R, D, L, U (for root iteration)
 
-# Transposition table: (board, next_card, n1, n2, n3, depth) -> value
-TT: dict[tuple[int, int, int, int, int, int], float] = {}
+def _sample_next_preview(n1: int, n2: int, n3: int, rng: np.random.Generator) -> Tuple[int, int, int, int]:
+    """
+    Sample the NEXT preview and update counts accordingly.
+    Returns (nxt_card, m1, m2, m3).
+    """
+    outcomes = next_preview_outcomes(n1, n2, n3)
+    probs = [p for _, p, _ in outcomes]
+    idx = rng.choice(len(outcomes), p=np.array(probs, dtype=np.float64))
+    nxt, _, (m1, m2, m3) = outcomes[idx]
+    return nxt, m1, m2, m3
 
-def expectimax_value(board: int, next_card: int, n1: int, n2: int, n3: int,
-                     depth: int, params: EMParams) -> float:
-    key = (board, next_card, n1, n2, n3, depth)
-    v = TT.get(key)
-    if v is not None:
-        return v
-
-    if depth == 0:
-        val = evaluate_board(board, next_card)
-        TT[key] = val
-        return val
-
-    best = -math.inf
-    any_moved = False
-
-    for mv in params.move_order:
+def _random_legal_move(board: int, rng: np.random.Generator) -> Optional[Tuple[int, int, List[int]]]:
+    """Return a random legal move: (mv, nb, cands)."""
+    legal = []
+    for mv in (0, 1, 2, 3):
         nb, cands, moved = MOVE_FUNS[mv](board)
-        if not moved or not cands:
-            continue
-        any_moved = True
+        if moved and cands:
+            legal.append((mv, nb, cands))
+    if not legal:
+        return None
+    return legal[rng.integers(len(legal))]
 
-        # Expected value over spawn POSITIONS (uniform), using the GUARANTEED current preview
-        L = len(cands)
-        pos_acc = 0.0
-        for pos in cands:
-            r, c = divmod(pos, 4)
-            child_board = set_cell(nb, r, c, next_card) & U64_MASK
+def mc_rollout(board: int, next_card: int, n1: int, n2: int, n3: int,
+               depth: int, rng: np.random.Generator) -> float:
+    """
+    Random playout for 'depth' agent moves.
+    Uses uniform choice among legal moves and uniform spawn position; next preview sampled by deck.
+    """
+    if depth <= 0:
+        return evaluate_board(board, next_card)
 
-            # Average over the NEXT preview using deck counts (ignoring bonus)
-            outcomes = next_preview_outcomes(n1, n2, n3)
-            ev_child = 0.0
-            for nxt, prob, (m1, m2, m3) in outcomes:
-                ev_child += prob * expectimax_value(child_board, nxt, m1, m2, m3,
-                                                    depth - 1, params)
-            pos_acc += ev_child
+    move_pack = _random_legal_move(board, rng)
+    if move_pack is None:
+        return evaluate_board(board, next_card)
 
-        exp_val = pos_acc / L
-        if exp_val > best:
-            best = exp_val
+    _, nb, cands = move_pack
+    pos = int(rng.choice(cands))
+    r, c = divmod(pos, 4)
+    child_board = set_cell(nb, r, c, next_card) & U64_MASK
 
-    if not any_moved:
-        val = evaluate_board(board, next_card)
-        TT[key] = val
-        return val
+    nxt, m1, m2, m3 = _sample_next_preview(n1, n2, n3, rng)
+    return mc_rollout(child_board, nxt, m1, m2, m3, depth - 1, rng)
 
-    TT[key] = best
-    return best
-
-def choose_move(board: int, next_card: int, n1: int, n2: int, n3: int,
-                depth: int, params: EMParams) -> Optional[int]:
+def choose_move_monte_carlo(board: int, next_card: int, n1: int, n2: int, n3: int,
+                            params: MCParams, rng: np.random.Generator) -> Optional[int]:
+    """
+    For each legal ROOT move, run 'rollouts' random playouts starting from that move and
+    pick the move with the highest average terminal heuristic.
+    """
     best_mv: Optional[int] = None
-    best_val = -math.inf
+    best_avg = -math.inf
 
     for mv in params.move_order:
         nb, cands, moved = MOVE_FUNS[mv](board)
         if not moved or not cands:
             continue
 
-        L = len(cands)
-        pos_acc = 0.0
-        for pos in cands:
+        total = 0.0
+        R = params.rollouts
+        for _ in range(R):
+            pos = int(rng.choice(cands))
             r, c = divmod(pos, 4)
             child_board = set_cell(nb, r, c, next_card) & U64_MASK
 
-            outcomes = next_preview_outcomes(n1, n2, n3)
-            ev_child = 0.0
-            for nxt, prob, (m1, m2, m3) in outcomes:
-                ev_child += prob * expectimax_value(child_board, nxt, m1, m2, m3,
-                                                    depth - 1, params)
-            pos_acc += ev_child
+            nxt, m1, m2, m3 = _sample_next_preview(n1, n2, n3, rng)
+            total += mc_rollout(child_board, nxt, m1, m2, m3, params.depth - 1, rng)
 
-        exp_val = pos_acc / L
-        if exp_val > best_val:
-            best_val = exp_val
+        avg = total / R
+        if avg > best_avg:
+            best_avg = avg
             best_mv = mv
 
     return best_mv
 
-# ---- Fixed-depth driver ----
+# ---- Play a single game (deck-aware, MC-only) ----
 
-def choose_move_fixed_depth(board: int, next_card: int, n1: int, n2: int, n3: int,
-                            max_depth: int) -> Tuple[Optional[int], int]:
-    """
-    Choose a move using a fixed search depth (no time budget).
-    Returns (best_move, reached_depth) where reached_depth == max_depth if a move exists.
-    """
-    params = EMParams(depth=max_depth)
-    mv = choose_move(board, next_card, n1, n2, n3, max_depth, params)
-    return mv, (max_depth if mv is not None else 0)
-
-# ---- Play a single game (deck-aware) ----
-
-def run_game(seed: Optional[int], max_steps: int, max_depth: int, verbose: bool):
+def run_game(seed: Optional[int], max_steps: int, mc_depth: int, rollouts: int, verbose: bool, game_num: int):
     g = Threes.new(seed=seed)
     step = 0
     start = time.perf_counter()
+    rng = np.random.default_rng(seed if seed is not None else None)
+    mc_params = MCParams(depth=mc_depth, rollouts=rollouts)
 
     while step < max_steps:
         board = g.board
@@ -251,14 +238,14 @@ def run_game(seed: Optional[int], max_steps: int, max_depth: int, verbose: bool)
         # Remaining counts after this preview was drawn:
         n1, n2, n3 = counts_from_deck(g)
 
-        mv, depth_reached = choose_move_fixed_depth(board, next_card, n1, n2, n3, max_depth)
+        mv = choose_move_monte_carlo(board, next_card, n1, n2, n3, mc_params, rng)
         if mv is None:
             break
 
         g.try_move(mv)
 
         if verbose:
-            print(f"\nStep {step}  Move: {mv}  Depth: {depth_reached}")
+            print(f"\nGame: {game_num+1}  Step: {step}   Move: {mv}   MC: depth={mc_params.depth}, rollouts={mc_params.rollouts}")
             g.print_board()
             print(f"Score: {g.score_board()}  Next preview: {g.next_preview()}  Elapsed: {time.perf_counter()-start:.3f}s")
 
@@ -298,15 +285,109 @@ def print_summary(scores: List[int], max_tiles: List[int], total_seconds: float)
         pct = int(round(100.0 * count / n))
         print(f"% of games with at least a {t}: {pct}%")
 
+# ---- Plotting helpers ----
+
+def plot_results(scores, max_tiles, total_seconds, show=True, outdir=None):
+    """
+    Make quick-look plots:
+      - Histogram of scores (with mean/median markers)
+      - Box-and-whisker plot of scores
+      - ECDF of scores (empirical CDF)
+      - Bar chart of '% of games >= tile thresholds'
+    Optionally saves PNGs if outdir is provided.
+    """
+    if not scores:
+        print("No scores to plot.")
+        return
+
+    import numpy as np
+
+    s = np.array(scores, dtype=float)
+    mt = np.array(max_tiles, dtype=int)
+
+    # ---------- Histogram ----------
+    fig1 = plt.figure()
+    plt.hist(s, bins="auto", edgecolor="black")
+    plt.axvline(s.mean(), linestyle="--", linewidth=1, label=f"Mean {s.mean():.1f}")
+    med = np.median(s)
+    plt.axvline(med, linestyle=":", linewidth=1, label=f"Median {med:.1f}")
+    plt.title("Score Distribution (Histogram)")
+    plt.xlabel("Score")
+    plt.ylabel("Count")
+    plt.legend()
+    plt.tight_layout()
+
+    # ---------- Box & whisker ----------
+    fig2 = plt.figure()
+    plt.boxplot(s, vert=True, showfliers=True)
+    plt.title("Score Distribution (Box & Whisker)")
+    plt.ylabel("Score")
+    plt.tight_layout()
+
+    # ---------- ECDF ----------
+    fig3 = plt.figure()
+    xs = np.sort(s)
+    ys = np.arange(1, len(xs) + 1) / len(xs)
+    plt.plot(xs, ys)
+    plt.title("Score ECDF")
+    plt.xlabel("Score")
+    plt.ylabel("Proportion ≤ score")
+    plt.tight_layout()
+
+    # ---------- Threshold hit-rates ----------
+    fig4 = plt.figure()
+    totals = []
+    labels = []
+    n = len(mt)
+    for t in _TILE_THRESHOLDS:
+        hit = int(np.sum(mt >= t))
+        pct = 100.0 * hit / n
+        totals.append(pct)
+        labels.append(str(t))
+    plt.bar(labels, totals)
+    plt.title("Max-Tile Threshold Hit Rates")
+    plt.xlabel("Threshold (tile value)")
+    plt.ylabel("% of games ≥ threshold")
+    plt.tight_layout()
+
+    # ---------- Optional save ----------
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+        paths = [
+            os.path.join(outdir, "scores_hist.png"),
+            os.path.join(outdir, "scores_boxplot.png"),
+            os.path.join(outdir, "scores_ecdf.png"),
+            os.path.join(outdir, "threshold_hit_rates.png"),
+        ]
+        for p, fig in zip(paths, [fig1, fig2, fig3, fig4]):
+            fig.savefig(p, dpi=150)
+        print("Saved plots:")
+        for p in paths:
+            print(" -", p)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig1); plt.close(fig2); plt.close(fig3); plt.close(fig4)
+
 # ---- CLI ----
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Deck-aware Expectimax Threes! (Numba-backed, fixed-depth)")
-    ap.add_argument("--seed", type=int, default=1000)
-    ap.add_argument("--steps", type=int, default=10_000)
-    ap.add_argument("--depth", type=int, default=2, help="Fixed max search depth")
+    ap = argparse.ArgumentParser(description="Deck-aware Threes! — Monte Carlo (serial only)")
+    ap.add_argument("--seed", type=int, default=3000)
+    ap.add_argument("--steps", type=int, default=100_000)
+    ap.add_argument("--mc-depth", type=int, default=10, help="Monte Carlo playout depth")
+    ap.add_argument("--rollouts", type=int, default=256, help="Monte Carlo rollouts per root move")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--games", type=int, default=100, help="Number of games to run (serial)")
+
+    # ---- Plotting args ----
+    ap.add_argument("--plot", action="store_true", default=True, help="Show result plots after runs")
+    ap.add_argument("--save-plots", metavar="DIR", default=None,
+                    help="Save plots to DIR (e.g., 'plots'). Implies --plot if a display is available.")
+    ap.add_argument("--no-show", action="store_true", default=False,
+                    help="Create/Save plots without opening a window (useful on headless runs)")
+
     args = ap.parse_args()
 
     # -------- Main execution (serial only) --------
@@ -318,8 +399,9 @@ if __name__ == "__main__":
     _numba_warmup()
     for i in range(args.games):
         seed = args.seed if args.seed is not None else None
-        args.seed += 1
-        max_val, score = run_game(seed, args.steps, args.depth, args.quiet)
+        if (args.seed != None):
+            args.seed += 1
+        max_val, score = run_game(seed, args.steps, args.mc_depth, args.rollouts, not args.quiet, i)
         scores.append(score)
         max_tiles.append(max_val)
         if not args.quiet:
@@ -327,3 +409,9 @@ if __name__ == "__main__":
 
     total_time = time.perf_counter() - t0
     print_summary(scores, max_tiles, total_time)
+
+    # -------- Optional visuals --------
+    want_plot = args.plot or (args.save_plots is not None)
+    if want_plot:
+        show = not args.no_show
+        plot_results(scores, max_tiles, total_time, show=show, outdir=args.save_plots)

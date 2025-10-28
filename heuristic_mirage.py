@@ -18,7 +18,5 @@ def _count_empty(board: int) -> int:
     return e
 
 def evaluate_board(board: int, next_card: int) -> float:
-    """
-    TODO: plug in your heuristic here. Keep it very cheap.
-    """
+    
     return _score_board(board) + 150.0 * _count_empty(board) + (5.0 if next_card >= 3 else next_card * 2.0)
