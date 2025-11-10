@@ -1,2 +1,6 @@
 # ai-project-1
-Solve the game Threes! with the highest average score possible
+This project serves as an AI bot for solving the video game Threes! which is a sliding tile game where players try to maximize their score before the board has no legal moves left. 
+
+The game was recreated from scratch inside of threes_engine.py and can be run independtly if that file is run. The engine is imported into the three bot files: dumb_bot.py, expectimax_bot.py, and monte_carlo_bot.py. These three bot files run the games on their own and provide statistical analysis over a series of games. The bots can take in different parameters like depth, number of games,  number of branches, verbose mode, and more. Comparing the bots to one another allows us to see how different algorithms compare to one another as well as to the "dumb" strategy of just moving right and down over and over. The last file included is the heuristic.py which provides the heuristic and has comments included which list testing of different heuristics we used to find the optimal heuristic.
+
+To run the code, install dependencies, especially numpy and numba. Then, adjust the parameters of the monte_carlo_bot or expecitmax_bot as desired and run the python file. Compare the median score to the score achieved by the human strategy of the dumb_bot.

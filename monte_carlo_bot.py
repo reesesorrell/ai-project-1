@@ -27,9 +27,7 @@ import os
 import matplotlib.pyplot as plt
 
 # CHANGE WHICH IMPORT IS ACTIVE TO TEST YOUR HEURISTIC
-from heuristic_reese import evaluate_board
-# from heuristic_landon import evaluate_board
-# from heuristic_mirage import evaluate_board
+from heuristic import evaluate_board
 
 # ---- Engine glue ----
 from threes_engine import (
@@ -376,10 +374,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Deck-aware Threes! — Monte Carlo (serial only)")
     ap.add_argument("--seed", type=int, default=3000)
     ap.add_argument("--steps", type=int, default=100_000)
-    ap.add_argument("--mc-depth", type=int, default=10, help="Monte Carlo playout depth")
-    ap.add_argument("--rollouts", type=int, default=256, help="Monte Carlo rollouts per root move")
+    ap.add_argument("--mc-depth", type=int, default=6, help="Monte Carlo playout depth")
+    ap.add_argument("--rollouts", type=int, default=128, help="Monte Carlo rollouts per root move")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--games", type=int, default=100, help="Number of games to run (serial)")
+    ap.add_argument("--games", type=int, default=10, help="Number of games to run (serial)")
 
     # ---- Plotting args ----
     ap.add_argument("--plot", action="store_true", default=True, help="Show result plots after runs")

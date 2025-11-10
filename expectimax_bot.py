@@ -304,9 +304,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Deck-aware Expectimax Threes! (Numba-backed, fixed-depth)")
     ap.add_argument("--seed", type=int, default=3000)
     ap.add_argument("--steps", type=int, default=10_000)
-    ap.add_argument("--depth", type=int, default=4, help="Fixed max search depth")
+    ap.add_argument("--depth", type=int, default=5, help="Fixed max search depth")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--games", type=int, default=10, help="Number of games to run (serial)")
+    ap.add_argument("--games", type=int, default=1, help="Number of games to run (serial)")
     args = ap.parse_args()
 
     # -------- Main execution (serial only) --------

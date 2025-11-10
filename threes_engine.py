@@ -6,16 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import random
-
-# Optional JIT (fallback to pure Python automatically)
-try:
-    import numpy as _np  # type: ignore
-    from numba import njit  # type: ignore
-    import numpy as _np
-    U64_MASK = (1 << 64) - 1
-    _NUMBA_OK = True
-except Exception:  # numpy/numba not available
-    _NUMBA_OK = False
+import numpy as _np  # type: ignore
+from numba import njit  # type: ignore
+import numpy as _np
+U64_MASK = (1 << 64) - 1
+_NUMBA_OK = True
 
 # ---------------------------
 # Encoding helpers (nibbles)
